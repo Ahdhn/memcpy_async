@@ -1,22 +1,12 @@
 #include <assert.h>
 #include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <numeric>
 #include "gtest/gtest.h"
 #include "helper.h"
 
-
-__device__ void compute(uint32_t*       global_out,
-                        uint32_t const* shared_in,
-                        const uint32_t  local_idx,
-                        const uint32_t  block_size)
-{
-    // Computes using all values of current batch from shared memory.
-    // Stores this thread's result back to global memory.
-    uint32_t out = shared_in[local_idx] + shared_in[block_size - local_idx - 1];
-    global_out[local_idx] = out;
-}
 
 __global__ void without_memcpy_async(uint32_t*       global_out,
                                      uint32_t const* global_in,
@@ -48,7 +38,6 @@ __global__ void without_memcpy_async(uint32_t*       global_out,
         block.sync();
 
         // Compute and write result to global memory
-        // compute(global_out + block_batch_idx, shared, local_idx);
         global_out[global_idx] =
             shared[local_idx] + shared[block.size() - local_idx - 1];
 
@@ -57,14 +46,52 @@ __global__ void without_memcpy_async(uint32_t*       global_out,
     }
 }
 
-
-__global__ void testKernel()
+__global__ void with_memcpy_async(uint32_t*       global_out,
+                                  uint32_t const* global_in,
+                                  uint32_t        size,
+                                  uint32_t        num_batch_per_block)
 {
+    auto grid  = cooperative_groups::this_grid();
+    auto block = cooperative_groups::this_thread_block();
+
+    // input size fits num_batch_per_block * grid_size
+    assert(size == num_batch_per_block * grid.size());
+
+    // block.size() * sizeof(int) bytes
+    extern __shared__ uint32_t shared[];
+
+    uint32_t local_idx = block.thread_rank();
+
+    for (uint32_t batch = 0; batch < num_batch_per_block; ++batch) {
+        // Compute the index of the current batch for this block in global
+        // memory:
+        uint32_t block_batch_idx =
+            block.group_index().x * block.size() + grid.size() * batch;
+
+        uint32_t global_idx = block_batch_idx + local_idx;
+
+        // Whole thread-group cooperatively copies whole batch to shared memory:
+        cooperative_groups::memcpy_async(block,
+                                         shared,
+                                         global_in + block_batch_idx,
+                                         sizeof(uint32_t) * block.size());
+
+        // Joins all threads, waits for all copies to complete
+        cooperative_groups::wait(block);
+
+
+        // Compute and write result to global memory
+        global_out[global_idx] =
+            shared[local_idx] + shared[block.size() - local_idx - 1];
+
+        // Wait for compute using shared memory to finish
+        block.sync();
+    }
 }
 
 TEST(Test, memcpy_async)
 {
-    uint32_t size                = 1024 * 1024;
+    uint32_t size                = 1024 * 1024 * 1024;
     uint32_t block_size          = 256;
     uint32_t num_batch_per_block = 2;
 
@@ -96,7 +123,8 @@ TEST(Test, memcpy_async)
             without_memcpy_async<<<grid_size, block_size, smem_bytes>>>(
                 d_out, d_in, size, num_batch_per_block);
         } else if (method == 1) {
-
+            with_memcpy_async<<<grid_size, block_size, smem_bytes>>>(
+                d_out, d_in, size, num_batch_per_block);
         }
         timer.stop();
         CUDA_ERROR(cudaMemcpy(h_out.data(),
@@ -107,6 +135,18 @@ TEST(Test, memcpy_async)
         for (uint32_t i = 0; i < h_out.size(); ++i) {
             ASSERT_EQ(h_out[i], block_size - 1);
         }
+
+        uint32_t           num_reg_per_thread = 0;
+        cudaFuncAttributes func_attr          = cudaFuncAttributes();
+        if (method == 0) {
+            CUDA_ERROR(cudaFuncGetAttributes(&func_attr, without_memcpy_async));
+        } else if (method == 1) {
+            CUDA_ERROR(cudaFuncGetAttributes(&func_attr, with_memcpy_async));
+        }
+        num_reg_per_thread = static_cast<uint32_t>(func_attr.numRegs);
+        std::cout << "method " << method << " took " << timer.elapsed_millis()
+                  << " (ms) and " << num_reg_per_thread
+                  << " register per thread" << std::endl;
     }
 
     auto err = cudaDeviceSynchronize();
